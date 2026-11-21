@@ -120,8 +120,8 @@ impl eframe::App for Settings {
                 ui.label(RichText::new(format!("At least {MIN_PASSWORD_LEN} characters.")).small().color(Color32::GRAY));
             });
 
-            section(ui, "Windows Hello", |ui| {
-                ui.checkbox(&mut self.config.windows_hello, "Also allow unlocking with Windows Hello");
+            section(ui, "Fingerprint", |ui| {
+                ui.checkbox(&mut self.config.windows_hello, "Also unlock with my fingerprint (Windows Hello)");
                 let (text, color) = match self.hello_status {
                     HelloStatus::Checking => ("Checking this PC…", Color32::GRAY),
                     HelloStatus::Available => ("Available: fingerprint, face or Windows PIN.", Color32::from_rgb(120, 200, 140)),

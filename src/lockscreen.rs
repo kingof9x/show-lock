@@ -1,43 +1,57 @@
-//! The lock screen itself: blurred background, clock, password card and
-//! on-screen keyboard. Platform-neutral; `overlay.rs` wires it into Windows,
-//! and `--preview` shows it in a normal window.
+//! The lock screen itself: a lightly blurred picture of the main screen and,
+//! once input is detected, a single password box. Nothing else.
+//!
+//! Platform-neutral; `win/overlay.rs` wires it into Windows, and `--preview`
+//! shows it in a normal window.
 
+use std::f32::consts::PI;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Event, FontId, Id, Key, Margin, Pos2, Rect, RichText,
-    Sense, Stroke, TextureHandle, TextureOptions, Vec2,
+    Sense, Shape, Stroke, TextureHandle, TextureOptions, Vec2,
 };
 
 use crate::blur::Image;
 use crate::throttle::Throttle;
-use crate::{clock, icon, style};
 
-/// Result of a Windows Hello check.
+/// Result of a Windows Hello prompt (the fallback when the fingerprint
+/// reader can't be read directly).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))] // only Windows produces these
 pub enum HelloOutcome {
     Verified,
     Cancelled,
-    Failed(String),
+    Failed,
 }
 
-/// Starts a Windows Hello check; the answer arrives on the receiver.
+/// What the fingerprint reader reports while the screen is locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum FingerEvent {
+    /// A finger of the signed-in Windows user.
+    Matched,
+    /// Someone else's finger, or a smudged read.
+    NoMatch,
+    /// The reader can't be used directly (none, or reserved by Windows).
+    Unavailable,
+}
+
+/// Opens the Windows Hello prompt; the answer arrives on the receiver.
 pub type HelloStarter = Box<dyn Fn() -> Receiver<HelloOutcome>>;
-/// Called once the right password (or Windows Hello) unlocks the screen.
+/// Called once the right password or fingerprint unlocks the screen.
 pub type UnlockFn = Box<dyn FnMut(&egui::Context)>;
 
 /// Ignore input this soon after the lock screen appears (the keys of the lock
 /// shortcut are often still being released).
 const STARTUP_GRACE: Duration = Duration::from_millis(800);
-const ACCENT: Color32 = Color32::from_rgb(96, 145, 255);
-const ERROR: Color32 = Color32::from_rgb(255, 120, 120);
+const FIELD_WIDTH: f32 = 300.0;
+const ERROR: Color32 = Color32::from_rgb(255, 110, 110);
 
 pub struct LockScreen {
     background: Option<TextureHandle>,
     background_image: Option<Image>,
-    lock_icon: Option<TextureHandle>,
     password_hash: Option<String>,
     timeout: Duration,
     started: Instant,
@@ -45,11 +59,12 @@ pub struct LockScreen {
     last_activity: Instant,
     password: String,
     checking: Option<Receiver<bool>>,
-    message: Option<(String, bool)>,
     shake_at: Option<Instant>,
     throttle: Throttle,
     keyboard: bool,
     shift: bool,
+    fingerprint: Option<Receiver<FingerEvent>>,
+    finger_live: bool,
     hello: Option<HelloStarter>,
     hello_pending: Option<Receiver<HelloOutcome>>,
     on_unlock: UnlockFn,
@@ -58,10 +73,14 @@ pub struct LockScreen {
 }
 
 impl LockScreen {
+    /// `fingerprint`: events from a reader that is already listening.
+    /// `hello`: opens the Windows Hello prompt, offered only when the reader
+    /// can't be listened to directly.
     pub fn new(
         background: Option<Image>,
         password_hash: Option<String>,
         timeout: Duration,
+        fingerprint: Option<Receiver<FingerEvent>>,
         hello: Option<HelloStarter>,
         on_unlock: UnlockFn,
     ) -> Self {
@@ -69,7 +88,6 @@ impl LockScreen {
         Self {
             background: None,
             background_image: background,
-            lock_icon: None,
             password_hash,
             timeout,
             started: now,
@@ -77,11 +95,12 @@ impl LockScreen {
             last_activity: now,
             password: String::new(),
             checking: None,
-            message: None,
             shake_at: None,
             throttle: Throttle::default(),
             keyboard: false,
             shift: false,
+            finger_live: fingerprint.is_some(),
+            fingerprint,
             hello,
             hello_pending: None,
             on_unlock,
@@ -90,7 +109,7 @@ impl LockScreen {
         }
     }
 
-    /// Open the password card straight away (used by `--preview`).
+    /// Open the password box straight away (used by `--preview`).
     pub fn show_prompt(&mut self, keyboard: bool) {
         self.prompt_open = true;
         self.keyboard = keyboard;
@@ -100,7 +119,7 @@ impl LockScreen {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        self.load_textures(&ctx);
+        self.load_background(&ctx);
         self.poll_results(&ctx);
         if self.unlocked {
             return;
@@ -108,42 +127,28 @@ impl LockScreen {
         self.track_activity(&ctx);
 
         let rect = ctx.content_rect();
-        let open = ctx.animate_bool_with_time(Id::unique("prompt"), self.prompt_open, 0.3);
+        let open = ctx.animate_bool_with_time(Id::unique("prompt"), self.prompt_open, 0.25);
         let kb = ctx.animate_bool_with_time(
             Id::unique("keyboard-shown"),
             self.prompt_open && self.keyboard,
             0.25,
         );
         self.paint_background(ui, rect, open);
-        // The clock makes room for the on-screen keyboard.
-        self.paint_clock(ui, rect, open, 1.0 - kb);
         if open > 0.0 {
-            self.card(&ctx, open, kb);
+            self.prompt(&ctx, open, kb);
             if self.keyboard {
                 self.on_screen_keyboard(&ctx, open);
             }
         }
-        // Keep the clock ticking and the countdowns moving.
-        ctx.request_repaint_after(Duration::from_millis(if self.prompt_open {
-            250
-        } else {
-            1000
-        }));
+        // Countdown after wrong passwords, and the fingerprint reader's news.
+        ctx.request_repaint_after(Duration::from_millis(250));
     }
 
-    fn load_textures(&mut self, ctx: &egui::Context) {
+    fn load_background(&mut self, ctx: &egui::Context) {
         if let Some(img) = self.background_image.take() {
             let color =
                 egui::ColorImage::from_rgba_unmultiplied([img.width, img.height], &img.rgba);
             self.background = Some(ctx.load_texture("background", color, TextureOptions::LINEAR));
-        }
-        if self.lock_icon.is_none() {
-            let size = 96;
-            let color = egui::ColorImage::from_rgba_unmultiplied(
-                [size, size],
-                &icon::padlock_rgba(size, [255, 255, 255]),
-            );
-            self.lock_icon = Some(ctx.load_texture("lock-icon", color, TextureOptions::LINEAR));
         }
     }
 
@@ -153,24 +158,37 @@ impl LockScreen {
                 Ok(true) => {
                     self.checking = None;
                     self.unlock(ctx);
+                    return;
                 }
                 Ok(false) | Err(TryRecvError::Disconnected) => {
                     self.checking = None;
                     self.throttle.record_failure(Instant::now());
-                    self.password.clear();
-                    self.shake_at = Some(Instant::now());
-                    self.message = Some(("Incorrect password".into(), true));
-                    self.focus_password = true;
+                    self.rejected();
                 }
                 Err(TryRecvError::Empty) => {}
+            }
+        }
+        while let Some(rx) = &self.fingerprint {
+            match rx.try_recv() {
+                Ok(FingerEvent::Matched) => {
+                    self.unlock(ctx);
+                    return;
+                }
+                Ok(FingerEvent::NoMatch) => {
+                    self.wake();
+                    self.rejected();
+                }
+                Ok(FingerEvent::Unavailable) | Err(TryRecvError::Disconnected) => {
+                    self.fingerprint = None;
+                    self.finger_live = false;
+                }
+                Err(TryRecvError::Empty) => break,
             }
         }
         if let Some(rx) = &self.hello_pending {
             let outcome = match rx.try_recv() {
                 Ok(o) => Some(o),
-                Err(TryRecvError::Disconnected) => Some(HelloOutcome::Failed(
-                    "Windows Hello stopped unexpectedly.".into(),
-                )),
+                Err(TryRecvError::Disconnected) => Some(HelloOutcome::Failed),
                 Err(TryRecvError::Empty) => None,
             };
             if let Some(outcome) = outcome {
@@ -179,12 +197,25 @@ impl LockScreen {
                 self.focus_password = true;
                 match outcome {
                     HelloOutcome::Verified => self.unlock(ctx),
-                    HelloOutcome::Cancelled => {
-                        self.message = Some(("Windows Hello was cancelled".into(), false))
-                    }
-                    HelloOutcome::Failed(e) => self.message = Some((e, true)),
+                    HelloOutcome::Cancelled => {}
+                    HelloOutcome::Failed => self.shake_at = Some(Instant::now()),
                 }
             }
+        }
+    }
+
+    /// Wrong password or finger: shake, clear, try again.
+    fn rejected(&mut self) {
+        self.password.clear();
+        self.shake_at = Some(Instant::now());
+        self.focus_password = true;
+    }
+
+    fn wake(&mut self) {
+        self.last_activity = Instant::now();
+        if !self.prompt_open {
+            self.prompt_open = true;
+            self.focus_password = true;
         }
     }
 
@@ -192,6 +223,10 @@ impl LockScreen {
         self.unlocked = true;
         self.password.clear();
         (self.on_unlock)(ctx);
+    }
+
+    fn busy(&self) -> bool {
+        self.checking.is_some() || self.hello_pending.is_some()
     }
 
     fn track_activity(&mut self, ctx: &egui::Context) {
@@ -223,30 +258,21 @@ impl LockScreen {
             return;
         }
         if active {
-            self.last_activity = now;
             if touched {
                 self.keyboard = true;
             }
-            if !self.prompt_open {
-                self.prompt_open = true;
-                self.focus_password = true;
+            if !self.prompt_open && self.throttle.remaining(now).is_none() {
                 // Keep the key that woke the screen as the first character.
-                if self.throttle.remaining(now).is_none() {
-                    self.password.push_str(&typed);
-                }
+                self.password.push_str(&typed);
             }
+            self.wake();
         }
-        let busy = self.checking.is_some() || self.hello_pending.is_some();
-        if self.prompt_open && !busy && now.duration_since(self.last_activity) > self.timeout {
+        let idle = now.duration_since(self.last_activity) > self.timeout;
+        let escape = ctx.input(|i| i.key_pressed(Key::Escape));
+        if self.prompt_open && !self.busy() && (idle || escape) {
             self.prompt_open = false;
             self.password.clear();
-            self.message = None;
             self.keyboard = false;
-        }
-        if self.prompt_open && ctx.input(|i| i.key_pressed(Key::Escape)) && !busy {
-            self.prompt_open = false;
-            self.password.clear();
-            self.message = None;
         }
     }
 
@@ -258,66 +284,22 @@ impl LockScreen {
                 let size = tex.size_vec2();
                 let scale = (rect.width() / size.x).max(rect.height() / size.y);
                 let draw = Rect::from_center_size(rect.center(), size * scale);
-                painter.image(
-                    tex.id(),
-                    draw,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::from_gray(205),
-                );
+                let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                painter.image(tex.id(), draw, uv, Color32::WHITE);
             }
-            None => style::paint_gradient(
-                painter,
-                rect,
-                Color32::from_rgb(28, 34, 58),
-                Color32::from_rgb(10, 12, 20),
-            ),
+            None => {
+                painter.rect_filled(rect, 0.0, Color32::from_rgb(24, 26, 32));
+            }
         }
-        // Darken towards the bottom, and more while the prompt is open.
-        let top = Color32::from_black_alpha((60.0 + 70.0 * open) as u8);
-        let bottom = Color32::from_black_alpha((150.0 + 50.0 * open) as u8);
-        style::paint_gradient(painter, rect, top, bottom);
+        // A light veil, a little darker while the password box is up.
+        painter.rect_filled(
+            rect,
+            0.0,
+            Color32::from_black_alpha((35.0 + 55.0 * open) as u8),
+        );
     }
 
-    fn paint_clock(&self, ui: &egui::Ui, rect: Rect, open: f32, opacity: f32) {
-        if opacity <= 0.0 {
-            return;
-        }
-        let mut painter = ui.painter().clone();
-        painter.set_opacity(opacity);
-        let (time, date) = clock::now_strings();
-        let lerp = |a: f32, b: f32| a + (b - a) * open;
-        let centre_y = lerp(
-            rect.center().y - 40.0,
-            rect.top() + rect.height() * 0.13 + 30.0,
-        );
-        let size = lerp(120.0, 64.0);
-        painter.text(
-            Pos2::new(rect.center().x, centre_y),
-            Align2::CENTER_CENTER,
-            time,
-            FontId::new(size, style::light_family()),
-            Color32::WHITE,
-        );
-        painter.text(
-            Pos2::new(rect.center().x, centre_y + size * 0.62),
-            Align2::CENTER_TOP,
-            date,
-            FontId::proportional(lerp(24.0, 18.0)),
-            Color32::from_white_alpha(220),
-        );
-        let hint_alpha = ((1.0 - open) * 170.0) as u8;
-        if hint_alpha > 0 {
-            painter.text(
-                Pos2::new(rect.center().x, rect.bottom() - 64.0),
-                Align2::CENTER_CENTER,
-                "Press any key or move the mouse to unlock",
-                FontId::proportional(16.0),
-                Color32::from_white_alpha(hint_alpha),
-            );
-        }
-    }
-
-    fn card(&mut self, ctx: &egui::Context, open: f32, kb: f32) {
+    fn prompt(&mut self, ctx: &egui::Context, open: f32, kb: f32) {
         let shake = self
             .shake_at
             .map(|t| t.elapsed().as_secs_f32())
@@ -326,148 +308,96 @@ impl LockScreen {
         if shake != 0.0 {
             ctx.request_repaint();
         }
-        let rise = (1.0 - open) * 24.0;
+        let rise = (1.0 - open) * 16.0;
         // Centred, or above the on-screen keyboard (about 300 points tall).
-        let keyboard_lift = 30.0 + (-165.0 - 30.0) * kb;
-        let now = Instant::now();
-        let blocked = self.throttle.remaining(now);
-        let busy = self.checking.is_some() || self.hello_pending.is_some();
+        let lift = -170.0 * kb;
+        let blocked = self.throttle.remaining(Instant::now());
+        let busy = self.busy();
+        let rejected = shake != 0.0;
+        let hello_button = !self.finger_live && self.hello.is_some();
 
-        egui::Area::new(Id::unique("card"))
-            .anchor(
-                Align2::CENTER_CENTER,
-                Vec2::new(shake, keyboard_lift + rise),
-            )
+        egui::Area::new(Id::unique("prompt-box"))
+            .anchor(Align2::CENTER_CENTER, Vec2::new(shake, lift + rise))
             .movable(false)
             .show(ctx, |ui| {
                 ui.multiply_opacity(open);
+                let border = if rejected {
+                    ERROR
+                } else {
+                    Color32::from_white_alpha(40)
+                };
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(22, 24, 32, 215))
-                    .stroke(Stroke::new(1.0, Color32::from_white_alpha(28)))
-                    .corner_radius(CornerRadius::same(20))
-                    .inner_margin(Margin::same(30))
+                    .fill(Color32::from_rgba_unmultiplied(16, 18, 24, 215))
+                    .stroke(Stroke::new(1.0, border))
+                    .corner_radius(CornerRadius::same(26))
+                    .inner_margin(Margin {
+                        left: 20,
+                        right: 8,
+                        top: 6,
+                        bottom: 6,
+                    })
                     .shadow(egui::Shadow {
-                        offset: [0, 12],
-                        blur: 40,
+                        offset: [0, 10],
+                        blur: 36,
                         spread: 0,
-                        color: Color32::from_black_alpha(110),
+                        color: Color32::from_black_alpha(100),
                     })
                     .show(ui, |ui| {
-                        let width = 340.0;
-                        ui.set_width(width);
-                        ui.vertical_centered(|ui| {
-                            if let Some(icon) = &self.lock_icon {
-                                ui.add(
-                                    egui::Image::new((icon.id(), Vec2::splat(40.0)))
-                                        .tint(Color32::from_white_alpha(235)),
-                                );
-                            }
-                            ui.add_space(10.0);
-                            ui.label(RichText::new("Locked").size(26.0).color(Color32::WHITE));
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new("Enter your password to unlock")
-                                    .size(14.0)
-                                    .color(Color32::from_white_alpha(170)),
-                            );
-                            ui.add_space(20.0);
-
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let hint = match blocked {
+                                Some(left) => format!("Try again in {}", fmt_duration(left)),
+                                None => "Password".to_string(),
+                            };
                             let edit = egui::TextEdit::singleline(&mut self.password)
                                 .password(true)
-                                .hint_text("Password")
+                                .frame(egui::Frame::NONE)
+                                .hint_text(
+                                    RichText::new(hint).color(Color32::from_white_alpha(120)),
+                                )
                                 .font(FontId::proportional(18.0))
-                                .margin(Margin::symmetric(12, 10))
-                                .desired_width(width)
+                                .text_color(Color32::WHITE)
+                                .align(Align2::LEFT_CENTER)
+                                .min_size(Vec2::new(0.0, 40.0))
+                                .desired_width(FIELD_WIDTH - 60.0)
                                 .interactive(blocked.is_none() && !busy);
                             let resp = ui.add(edit);
                             if self.focus_password && blocked.is_none() && !busy {
                                 resp.request_focus();
                                 self.focus_password = false;
                             }
-                            let enter =
-                                resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                            if resp.changed() {
-                                self.message = None;
-                            }
-
-                            ui.add_space(14.0);
-                            let label = if self.checking.is_some() {
-                                "Checking…"
-                            } else {
-                                "Unlock"
-                            };
-                            let unlock_btn = egui::Button::new(
-                                RichText::new(label).size(16.0).color(Color32::WHITE),
-                            )
-                            .fill(ACCENT)
-                            .min_size(Vec2::new(width, 42.0));
-                            let clicked = ui
-                                .add_enabled(
-                                    blocked.is_none() && !busy && !self.password.is_empty(),
-                                    unlock_btn,
-                                )
-                                .clicked();
-                            if (clicked || enter) && !busy {
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                                 self.submit();
                             }
 
-                            if self.hello.is_some() {
-                                ui.add_space(8.0);
-                                let label = if self.hello_pending.is_some() {
-                                    "Waiting for Windows Hello…"
+                            // The fingerprint mark: a quiet sign the reader is
+                            // listening, or a button for the Windows Hello prompt.
+                            let (rect, resp) =
+                                ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+                            if self.finger_live || hello_button {
+                                let hovered = hello_button && resp.hovered() && !busy;
+                                if hovered {
+                                    ui.painter().circle_filled(
+                                        rect.center(),
+                                        19.0,
+                                        Color32::from_white_alpha(20),
+                                    );
+                                }
+                                let alpha = if busy || hovered { 240 } else { 150 };
+                                let color = if rejected {
+                                    ERROR
                                 } else {
-                                    "Use Windows Hello"
+                                    Color32::from_white_alpha(alpha)
                                 };
-                                let btn = egui::Button::new(RichText::new(label).size(15.0))
-                                    .fill(Color32::from_white_alpha(18))
-                                    .min_size(Vec2::new(width, 40.0));
-                                if ui.add_enabled(!busy, btn).clicked() {
+                                paint_fingerprint(ui.painter(), rect.center(), 11.0, color);
+                                if hello_button
+                                    && !busy
+                                    && resp
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                {
                                     self.start_hello();
                                 }
-                            }
-
-                            ui.add_space(12.0);
-                            let (text, color) = match (blocked, &self.message) {
-                                (Some(left), _) => (
-                                    format!(
-                                        "Too many attempts. Try again in {}",
-                                        fmt_duration(left)
-                                    ),
-                                    ERROR,
-                                ),
-                                (None, Some((m, true))) => (m.clone(), ERROR),
-                                (None, Some((m, false))) => {
-                                    (m.clone(), Color32::from_white_alpha(190))
-                                }
-                                (None, None) => (String::new(), Color32::TRANSPARENT),
-                            };
-                            ui.label(
-                                RichText::new(if text.is_empty() {
-                                    " ".to_string()
-                                } else {
-                                    text
-                                })
-                                .size(14.0)
-                                .color(color),
-                            );
-
-                            ui.add_space(4.0);
-                            let kb_label = if self.keyboard {
-                                "Hide on-screen keyboard"
-                            } else {
-                                "On-screen keyboard"
-                            };
-                            let kb = ui.add(
-                                egui::Label::new(
-                                    RichText::new(kb_label)
-                                        .size(13.0)
-                                        .color(Color32::from_white_alpha(150)),
-                                )
-                                .sense(Sense::click()),
-                            );
-                            if kb.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                self.keyboard = !self.keyboard;
-                                self.focus_password = true;
                             }
                         });
                     });
@@ -475,7 +405,10 @@ impl LockScreen {
     }
 
     fn submit(&mut self) {
-        if self.password.is_empty() || self.throttle.remaining(Instant::now()).is_some() {
+        if self.password.is_empty()
+            || self.busy()
+            || self.throttle.remaining(Instant::now()).is_some()
+        {
             return;
         }
         let password = std::mem::take(&mut self.password);
@@ -491,13 +424,11 @@ impl LockScreen {
             let _ = tx.send(ok);
         });
         self.checking = Some(rx);
-        self.message = None;
     }
 
     fn start_hello(&mut self) {
         if let Some(start) = &self.hello {
             self.hello_pending = Some(start());
-            self.message = None;
         }
     }
 
@@ -507,9 +438,7 @@ impl LockScreen {
         } else {
             ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm-_."]
         };
-        let busy = self.checking.is_some()
-            || self.hello_pending.is_some()
-            || self.throttle.remaining(Instant::now()).is_some();
+        let busy = self.busy() || self.throttle.remaining(Instant::now()).is_some();
         let key_size = Vec2::new(52.0, 50.0);
         let mut pressed: Option<KbKey> = None;
         egui::Area::new(Id::unique("keyboard"))
@@ -521,7 +450,7 @@ impl LockScreen {
             .show(ctx, |ui| {
                 ui.multiply_opacity(open);
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(22, 24, 32, 215))
+                    .fill(Color32::from_rgba_unmultiplied(16, 18, 24, 215))
                     .stroke(Stroke::new(1.0, Color32::from_white_alpha(28)))
                     .corner_radius(CornerRadius::same(18))
                     .inner_margin(Margin::same(14))
@@ -530,10 +459,9 @@ impl LockScreen {
                         for row in rows {
                             ui.horizontal(|ui| {
                                 // Centre shorter rows.
+                                let n = row.chars().count() as f32;
                                 let full = 10.0 * key_size.x + 9.0 * 6.0;
-                                let this = row.chars().count() as f32 * key_size.x
-                                    + (row.chars().count() as f32 - 1.0) * 6.0;
-                                ui.add_space((full - this) / 2.0);
+                                ui.add_space((full - (n * key_size.x + (n - 1.0) * 6.0)) / 2.0);
                                 for c in row.chars() {
                                     if key_button(ui, &c.to_string(), key_size, false).clicked() {
                                         pressed = Some(KbKey::Char(c));
@@ -542,24 +470,17 @@ impl LockScreen {
                             });
                         }
                         ui.horizontal(|ui| {
-                            if key_button(ui, "Shift", Vec2::new(110.0, key_size.y), self.shift)
-                                .clicked()
-                            {
+                            let h = key_size.y;
+                            if key_button(ui, "Shift", Vec2::new(110.0, h), self.shift).clicked() {
                                 pressed = Some(KbKey::Shift);
                             }
-                            if key_button(ui, "Space", Vec2::new(250.0, key_size.y), false)
-                                .clicked()
-                            {
+                            if key_button(ui, "Space", Vec2::new(250.0, h), false).clicked() {
                                 pressed = Some(KbKey::Char(' '));
                             }
-                            if key_button(ui, "Delete", Vec2::new(90.0, key_size.y), false)
-                                .clicked()
-                            {
+                            if key_button(ui, "Delete", Vec2::new(90.0, h), false).clicked() {
                                 pressed = Some(KbKey::Backspace);
                             }
-                            if key_button(ui, "Enter", Vec2::new(110.0, key_size.y), false)
-                                .clicked()
-                            {
+                            if key_button(ui, "Enter", Vec2::new(110.0, h), false).clicked() {
                                 pressed = Some(KbKey::Enter);
                             }
                         });
@@ -570,7 +491,6 @@ impl LockScreen {
             if busy {
                 return;
             }
-            self.message = None;
             match k {
                 KbKey::Char(c) => {
                     self.password.push(c);
@@ -595,7 +515,7 @@ enum KbKey {
 
 fn key_button(ui: &mut egui::Ui, label: &str, size: Vec2, active: bool) -> egui::Response {
     let fill = if active {
-        ACCENT
+        Color32::from_white_alpha(70)
     } else {
         Color32::from_white_alpha(22)
     };
@@ -605,6 +525,25 @@ fn key_button(ui: &mut egui::Ui, label: &str, size: Vec2, active: bool) -> egui:
             .min_size(size)
             .corner_radius(CornerRadius::same(10)),
     )
+}
+
+/// A simple fingerprint mark: nested arches, open at the bottom.
+fn paint_fingerprint(painter: &egui::Painter, centre: Pos2, radius: f32, color: Color32) {
+    let stroke = Stroke::new(1.6, color);
+    for (i, r) in [0.25f32, 0.5, 0.75, 1.0].iter().enumerate() {
+        let r = r * radius;
+        // Inner arches are fuller; the outer ones open up more at the bottom.
+        let gap = 0.35 + 0.15 * i as f32;
+        let (start, end) = (PI * (0.5 + gap), PI * (2.5 - gap));
+        let steps = 24;
+        let points: Vec<Pos2> = (0..=steps)
+            .map(|s| {
+                let a = start + (end - start) * s as f32 / steps as f32;
+                Pos2::new(centre.x + r * a.cos(), centre.y + 2.0 + r * 1.2 * a.sin())
+            })
+            .collect();
+        painter.add(Shape::line(points, stroke));
+    }
 }
 
 fn fmt_duration(d: Duration) -> String {

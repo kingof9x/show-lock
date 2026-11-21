@@ -29,6 +29,7 @@ pub fn run() {
                 Some(background),
                 config.password_hash.clone(),
                 Duration::from_secs(u64::from(config.prompt_timeout_secs)),
+                preview_fingerprint(&config),
                 preview_hello(&config, cc),
                 Box::new(|ctx| ctx.send_viewport_cmd(egui::ViewportCommand::Close)),
             );
@@ -55,8 +56,12 @@ impl eframe::App for Preview {
     }
 }
 
-/// The real screen on Windows; a colourful sample elsewhere.
+/// The real screen on Windows; a colourful sample elsewhere. For checking
+/// the blur, `SHOW_LOCK_PREVIEW_PPM=screen.ppm` uses that picture instead.
 fn background() -> blur::Image {
+    if let Some((w, h, bgra)) = std::env::var_os("SHOW_LOCK_PREVIEW_PPM").and_then(read_ppm) {
+        return blur::blurred_background(&bgra, w, h);
+    }
     #[cfg(windows)]
     if let Some(shot) = crate::win::capture::primary_screenshot() {
         return blur::blurred_background(&shot.bgra, shot.width, shot.height);
@@ -95,6 +100,23 @@ fn preview_hello(
         .then(|| crate::win::hello::starter(crate::win::hwnd_of(cc)))
 }
 
+#[cfg(windows)]
+fn preview_fingerprint(
+    config: &Config,
+) -> Option<std::sync::mpsc::Receiver<crate::lockscreen::FingerEvent>> {
+    config.windows_hello.then(crate::win::fingerprint::listen)
+}
+
+#[cfg(not(windows))]
+fn preview_fingerprint(
+    _config: &Config,
+) -> Option<std::sync::mpsc::Receiver<crate::lockscreen::FingerEvent>> {
+    // Shows the fingerprint mark in development previews.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::mem::forget(tx);
+    Some(rx)
+}
+
 #[cfg(not(windows))]
 fn preview_hello(
     config: &Config,
@@ -105,9 +127,7 @@ fn preview_hello(
         .then(|| -> crate::lockscreen::HelloStarter {
             Box::new(|| {
                 let (tx, rx) = std::sync::mpsc::channel();
-                let _ = tx.send(crate::lockscreen::HelloOutcome::Failed(
-                    "Windows Hello needs Windows.".into(),
-                ));
+                let _ = tx.send(crate::lockscreen::HelloOutcome::Failed);
                 rx
             })
         })
@@ -137,4 +157,33 @@ pub fn dev_screenshot(ctx: &egui::Context, frames: &mut u32) {
         });
     }
     ctx.request_repaint();
+}
+
+/// Binary PPM (P6, 8-bit) to (width, height, BGRA).
+fn read_ppm(path: std::ffi::OsString) -> Option<(usize, usize, Vec<u8>)> {
+    let data = std::fs::read(path).ok()?;
+    let mut fields = Vec::new();
+    let mut pos = 0;
+    while fields.len() < 4 {
+        while data.get(pos)?.is_ascii_whitespace() {
+            pos += 1;
+        }
+        let start = pos;
+        while !data.get(pos)?.is_ascii_whitespace() {
+            pos += 1;
+        }
+        fields.push(std::str::from_utf8(&data[start..pos]).ok()?.to_string());
+    }
+    let (w, h): (usize, usize) = (fields[1].parse().ok()?, fields[2].parse().ok()?);
+    let rgb = data.get(pos + 1..pos + 1 + w * h * 3)?;
+    if fields[0] != "P6" {
+        return None;
+    }
+    Some((
+        w,
+        h,
+        rgb.chunks_exact(3)
+            .flat_map(|p| [p[2], p[1], p[0], 255])
+            .collect(),
+    ))
 }

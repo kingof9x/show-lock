@@ -51,11 +51,15 @@ pub fn run() {
             if let Some(h) = hwnd {
                 guard::set_overlay(h);
             }
+            // Fingerprint straight from the reader; the Windows Hello prompt
+            // is the fallback when the reader can't be used that way.
+            let fingerprint = config.windows_hello.then(super::fingerprint::listen);
             let hello = (config.windows_hello && hwnd.is_some()).then(|| hello::starter(hwnd));
             let screen = LockScreen::new(
                 background,
                 Some(hash),
                 Duration::from_secs(u64::from(config.prompt_timeout_secs.max(5))),
+                fingerprint,
                 hello,
                 Box::new(|_| {
                     guard::release();

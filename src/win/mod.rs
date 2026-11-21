@@ -2,6 +2,7 @@
 
 pub mod accessibility;
 pub mod capture;
+pub mod fingerprint;
 pub mod guard;
 pub mod hello;
 pub mod overlay;

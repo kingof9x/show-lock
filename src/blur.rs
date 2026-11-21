@@ -12,14 +12,15 @@ pub struct Image {
 }
 
 /// Longest side of the shrunken image, in pixels.
-const TARGET_SIZE: usize = 320;
+const TARGET_SIZE: usize = 960;
 
 /// Shrink a BGRA screenshot (as Windows gives it) to about [`TARGET_SIZE`]
-/// pixels on its longest side and blur it.
+/// pixels on its longest side and blur it lightly.
 pub fn blurred_background(bgra: &[u8], width: usize, height: usize) -> Image {
     let factor = (width.max(height) / TARGET_SIZE).max(1);
     let mut img = downscale_bgra(bgra, width, height, factor);
-    box_blur(&mut img, 4, 3);
+    // Enough to hide text, little enough to make out windows and apps.
+    box_blur(&mut img, 6, 3);
     img
 }
 

@@ -46,22 +46,6 @@ fn verify(hwnd: Option<isize>) -> HelloOutcome {
     match op.and_then(|op| op.join()) {
         Ok(UserConsentVerificationResult::Verified) => HelloOutcome::Verified,
         Ok(UserConsentVerificationResult::Canceled) => HelloOutcome::Cancelled,
-        Ok(UserConsentVerificationResult::DeviceNotPresent) => {
-            HelloOutcome::Failed("No Windows Hello device found.".into())
-        }
-        Ok(UserConsentVerificationResult::NotConfiguredForUser) => {
-            HelloOutcome::Failed("Windows Hello isn't set up for this account.".into())
-        }
-        Ok(UserConsentVerificationResult::DisabledByPolicy) => {
-            HelloOutcome::Failed("Windows Hello is turned off by policy.".into())
-        }
-        Ok(UserConsentVerificationResult::DeviceBusy) => {
-            HelloOutcome::Failed("Windows Hello is busy. Try again.".into())
-        }
-        Ok(UserConsentVerificationResult::RetriesExhausted) => {
-            HelloOutcome::Failed("Too many Windows Hello attempts. Use your password.".into())
-        }
-        Ok(_) => HelloOutcome::Failed("Windows Hello didn't work. Use your password.".into()),
-        Err(e) => HelloOutcome::Failed(format!("Windows Hello isn't available ({}).", e.message())),
+        _ => HelloOutcome::Failed,
     }
 }
