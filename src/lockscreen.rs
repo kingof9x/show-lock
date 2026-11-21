@@ -46,7 +46,7 @@ pub type UnlockFn = Box<dyn FnMut(&egui::Context)>;
 /// Ignore input this soon after the lock screen appears (the keys of the lock
 /// shortcut are often still being released).
 const STARTUP_GRACE: Duration = Duration::from_millis(800);
-const FIELD_WIDTH: f32 = 300.0;
+const FIELD_WIDTH: f32 = 220.0;
 const ERROR: Color32 = Color32::from_rgb(255, 110, 110);
 
 pub struct LockScreen {
@@ -329,16 +329,16 @@ impl LockScreen {
                 egui::Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(16, 18, 24, 215))
                     .stroke(Stroke::new(1.0, border))
-                    .corner_radius(CornerRadius::same(26))
+                    .corner_radius(CornerRadius::ZERO)
                     .inner_margin(Margin {
-                        left: 20,
-                        right: 8,
-                        top: 6,
-                        bottom: 6,
+                        left: 12,
+                        right: 4,
+                        top: 2,
+                        bottom: 2,
                     })
                     .shadow(egui::Shadow {
-                        offset: [0, 10],
-                        blur: 36,
+                        offset: [0, 6],
+                        blur: 24,
                         spread: 0,
                         color: Color32::from_black_alpha(100),
                     })
@@ -355,11 +355,11 @@ impl LockScreen {
                                 .hint_text(
                                     RichText::new(hint).color(Color32::from_white_alpha(120)),
                                 )
-                                .font(FontId::proportional(18.0))
+                                .font(FontId::proportional(15.0))
                                 .text_color(Color32::WHITE)
                                 .align(Align2::LEFT_CENTER)
-                                .min_size(Vec2::new(0.0, 40.0))
-                                .desired_width(FIELD_WIDTH - 60.0)
+                                .min_size(Vec2::new(0.0, 30.0))
+                                .desired_width(FIELD_WIDTH - 46.0)
                                 .interactive(blocked.is_none() && !busy);
                             let resp = ui.add(edit);
                             if self.focus_password && blocked.is_none() && !busy {
@@ -373,13 +373,13 @@ impl LockScreen {
                             // The fingerprint mark: a quiet sign the reader is
                             // listening, or a button for the Windows Hello prompt.
                             let (rect, resp) =
-                                ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+                                ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
                             if self.finger_live || hello_button {
                                 let hovered = hello_button && resp.hovered() && !busy;
                                 if hovered {
-                                    ui.painter().circle_filled(
-                                        rect.center(),
-                                        19.0,
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        0.0,
                                         Color32::from_white_alpha(20),
                                     );
                                 }
@@ -389,7 +389,7 @@ impl LockScreen {
                                 } else {
                                     Color32::from_white_alpha(alpha)
                                 };
-                                paint_fingerprint(ui.painter(), rect.center(), 11.0, color);
+                                paint_fingerprint(ui.painter(), rect.center(), 8.0, color);
                                 if hello_button
                                     && !busy
                                     && resp
@@ -529,7 +529,7 @@ fn key_button(ui: &mut egui::Ui, label: &str, size: Vec2, active: bool) -> egui:
 
 /// A simple fingerprint mark: nested arches, open at the bottom.
 fn paint_fingerprint(painter: &egui::Painter, centre: Pos2, radius: f32, color: Color32) {
-    let stroke = Stroke::new(1.6, color);
+    let stroke = Stroke::new(1.3, color);
     for (i, r) in [0.25f32, 0.5, 0.75, 1.0].iter().enumerate() {
         let r = r * radius;
         // Inner arches are fuller; the outer ones open up more at the bottom.
