@@ -452,7 +452,7 @@ impl LockScreen {
                 egui::Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(16, 18, 24, 215))
                     .stroke(Stroke::new(1.0, Color32::from_white_alpha(28)))
-                    .corner_radius(CornerRadius::same(18))
+                    .corner_radius(CornerRadius::ZERO)
                     .inner_margin(Margin::same(14))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = Vec2::splat(6.0);
@@ -523,7 +523,7 @@ fn key_button(ui: &mut egui::Ui, label: &str, size: Vec2, active: bool) -> egui:
         egui::Button::new(RichText::new(label).size(18.0).color(Color32::WHITE))
             .fill(fill)
             .min_size(size)
-            .corner_radius(CornerRadius::same(10)),
+            .corner_radius(CornerRadius::ZERO),
     )
 }
 
