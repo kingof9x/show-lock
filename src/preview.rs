@@ -182,7 +182,9 @@ fn read_ppm(path: std::ffi::OsString) -> Option<(usize, usize, Vec<u8>)> {
     Some((
         w,
         h,
-        rgb.chunks_exact(3)
+        rgb.as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[2], p[1], p[0], 255])
             .collect(),
     ))
