@@ -1,0 +1,156 @@
+# Builds Show Lock for Windows. On a pull request the files show up as download links at the
+# top of the PR (see pr-test-builds.yml).
+#
+# To publish a version: Actions tab > Build and release > Run workflow. The version box says
+# "next" (last release + 1); type a number to choose one (for example 1.2), or clear it to only
+# test the build. The workflow sets that version in the app, builds it, then creates the
+# release with Show-Lock-windows.zip attached. (Pushing a tag such as v1.2 also works.)
+#
+# The build is unsigned, so Windows shows SmartScreen the first time it runs.
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version. "next" = last release + 1 (for example 1.3 after 1.2), or type one (for example 2.0). Empty = only test the build, no release.'
+        required: false
+        default: 'next'
+
+permissions:
+  contents: write
+
+concurrency:
+  # A newer push to the same PR cancels its older, now pointless build.
+  # Runs on main (pushes and releases) are never cancelled.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  version:
+    # Works out the release version: from the Run workflow box ("next" = last release + 1)
+    # or from a pushed v* tag. Empty means "only test the build, no release".
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          INPUT: ${{ inputs.version }}
+        run: |
+          v=""
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            v=$(printf '%s' "$GITHUB_REF_NAME" | grep -oE '[0-9]+(\.[0-9]+)*$' || true)
+          elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ -n "$INPUT" ]; then
+            if [ "$INPUT" = next ]; then
+              last=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(.draft == false and .prerelease == false) | .tag_name][0] // ""')
+              num=$(printf '%s' "$last" | grep -oE '[0-9]+(\.[0-9]+)*$' || true)
+              if [ -z "$num" ]; then
+                echo "::error::There is no release yet, so there is nothing to add 1 to. Run again and type the first version (for example 1.0)."; exit 1
+              fi
+              v=$(printf '%s' "$num" | awk -F. -v OFS=. '{$NF=$NF+1; print}')
+              echo "Last release: ${last:-none}"
+            else
+              v="${INPUT#[vV]}"
+            fi
+          fi
+          if [ -n "$v" ] && ! printf '%s' "$v" | grep -qE '^[0-9]+(\.[0-9]+)*$'; then
+            echo "::error::'$v' is not a version number. Use numbers like 1.4 or 2.0.1, or 'next'."; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=${v:+v$v}" >> "$GITHUB_OUTPUT"
+          if [ -n "$v" ]; then echo "### Releasing v$v" >> "$GITHUB_STEP_SUMMARY"; else echo "### Test build only, no release" >> "$GITHUB_STEP_SUMMARY"; fi
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Faster settings for test builds (no version = not a release)
+        if: needs.version.outputs.version == ''
+        shell: bash
+        run: |
+          # Real releases keep the full release profile (LTO, few codegen units).
+          # Test builds (PRs, pushes to main) skip LTO and use more codegen units:
+          # same optimisation level, much shorter compile.
+          echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Set the release version
+        if: needs.version.outputs.version != ''
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          v="$INPUT_VERSION"
+          # Cargo needs three numbers: 1.2 becomes 1.2.0
+          case "$v" in *.*.*) ;; *.*) v="$v.0" ;; *) v="$v.0.0" ;; esac
+          echo "Building version $v"
+          # perl, not sed: macOS sed doesn't support "first match only" addresses
+          perl -0pi -e 's/^version = ".*?"/version = "'"$v"'"/m' Cargo.toml
+          awk -v v="$v" 'prev=="name = \"show-lock\"" && /^version = / {$0="version = \"" v "\""} {print; prev=$0}' Cargo.lock > Cargo.lock.new && mv Cargo.lock.new Cargo.lock
+          grep -m1 '^version' Cargo.toml
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "dist/Show Lock" | Out-Null
+          Copy-Item target/release/show-lock.exe "dist/Show Lock/Show Lock.exe"
+          Copy-Item README.md "dist/Show Lock/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Show-Lock-windows
+          path: dist/Show Lock
+
+  release:
+    needs: [version, windows]
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-files
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          INPUT_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          TAG="v$INPUT_VERSION"
+          echo "Publishing release $TAG"
+          mkdir upload
+          (cd dist-files/Show-Lock-windows && zip -qr "$GITHUB_WORKSPACE/upload/Show-Lock-windows.zip" .)
+          ls -la upload
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" upload/* -R "$REPO" --clobber
+          else
+            gh release create "$TAG" upload/* -R "$REPO" --target "$GITHUB_SHA" --title "Show Lock ${TAG#v}" \
+              --notes "Show-Lock-windows.zip: unzip and run Show Lock.exe. Unsigned, so Windows shows SmartScreen the first time."
+          fi
+
+  build-passed:
+    # One check that sums up the whole build. The repo's "Require passing build" rule
+    # waits for this before the PR can be merged.
+    name: Build passed
+    if: always()
+    needs: [version, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that every build job passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null
